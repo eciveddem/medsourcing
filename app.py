@@ -10,7 +10,13 @@ OPENFDA_BASE = "https://api.fda.gov"
 REG_LISTING_ENDPOINT = f"{OPENFDA_BASE}/device/registrationlisting.json"
 CLASS_ENDPOINT = f"{OPENFDA_BASE}/device/classification.json"
 
+# Optional: put an openFDA key in .streamlit/secrets.toml as:
+# OPENFDA_API_KEY = "your_key_here"
+OPENFDA_API_KEY = st.secrets.get("OPENFDA_API_KEY", None)
+DEFAULT_HEADERS = {"X-Api-Key": OPENFDA_API_KEY} if OPENFDA_API_KEY else {}
+
 def country_to_iso2(name_or_code: str) -> str | None:
+    """Accepts 'United States' or 'US' and returns ISO-2 like 'US'."""
     if not name_or_code:
         return None
     s = name_or_code.strip()
@@ -23,11 +29,10 @@ def country_to_iso2(name_or_code: str) -> str | None:
 
 @st.cache_data(show_spinner=False)
 def lookup_product_codes_by_name(q: str, limit=50):
-    # Search device classification by device name text to collect product codes
-    # Example: search=device_name:pulse+oximeter
+    """Search device classification by device name, return unique product codes."""
     query = f"search=device_name:{quote_plus(q)}&limit={limit}"
     url = f"{CLASS_ENDPOINT}?{query}"
-    r = requests.get(url, timeout=30)
+    r = requests.get(url, timeout=30, headers=DEFAULT_HEADERS)
     if r.status_code != 200:
         return []
     data = r.json()
@@ -35,11 +40,19 @@ def lookup_product_codes_by_name(q: str, limit=50):
     codes = sorted({rec.get("product_code") for rec in results if rec.get("product_code")})
     return codes
 
-def build_reglisting_query(iso2: str, product_codes: list[str], limit=1000, skip=0):
+def build_reglisting_query(iso2: str, product_codes: list[str], state_code: str = "", limit=1000, skip=0):
+    """
+    Build openFDA Registrations & Listings query.
+    Examples:
+      registration.iso_country_code:US
+      registration.state_code:CA  (only when iso2 == 'US')
+      products.product_code:DQD
+    """
     search_parts = []
     if iso2:
         search_parts.append(f"registration.iso_country_code:{iso2}")
-    # multiple product codes: (products.product_code:AAA+products.product_code:BBB)
+    if iso2 == "US" and state_code:
+        search_parts.append(f"registration.state_code:{state_code.upper()}")
     for pc in product_codes:
         if pc:
             search_parts.append(f"products.product_code:{pc.upper()}")
@@ -48,15 +61,17 @@ def build_reglisting_query(iso2: str, product_codes: list[str], limit=1000, skip
     return f"{REG_LISTING_ENDPOINT}?search={search}&{params}" if search else f"{REG_LISTING_ENDPOINT}?{params}"
 
 @st.cache_data(show_spinner=True)
-def fetch_reglisting(iso2: str, product_codes: list[str], max_records=2000):
+def fetch_reglisting(iso2: str, product_codes: list[str], state_code: str = "", max_records=2000):
+    """Fetch paged results up to max_records."""
     rows = []
     limit = 1000
     skip = 0
     fetched = 0
     while fetched < max_records:
-        url = build_reglisting_query(iso2, product_codes, limit=limit, skip=skip)
-        r = requests.get(url, timeout=60)
+        url = build_reglisting_query(iso2, product_codes, state_code=state_code, limit=limit, skip=skip)
+        r = requests.get(url, timeout=60, headers=DEFAULT_HEADERS)
         if r.status_code != 200:
+            # Stop on error but return what we have
             break
         payload = r.json()
         results = payload.get("results", [])
@@ -65,10 +80,12 @@ def fetch_reglisting(iso2: str, product_codes: list[str], max_records=2000):
         rows.extend(results)
         n = len(results)
         fetched += n
-        if n < limit:  # no more pages
+        if n < limit:
             break
         skip += n
     return rows
+
+# -------------------- UI --------------------
 
 st.title("FDA Manufacturer Finder")
 st.caption("Filter FDA device establishments by **location** and **products** (openFDA).")
@@ -77,6 +94,18 @@ with st.sidebar:
     st.header("Filters")
     country_input = st.text_input("Country (name or ISO-2)", value="United States")
     iso2 = country_to_iso2(country_input) or ""
+
+    # --- State filter only for US ---
+    state_code = ""
+    if iso2 == "US":
+        us_states = [
+            "", "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN",
+            "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV",
+            "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN",
+            "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"
+        ]
+        state_code = st.selectbox("Filter by state (optional)", options=us_states)
+
     mode = st.radio("Search by:", ["Product code(s)", "Device name"], horizontal=True)
 
     product_codes = []
@@ -90,17 +119,20 @@ with st.sidebar:
             with st.spinner("Finding product codes..."):
                 product_codes = lookup_product_codes_by_name(device_name)
 
-    st.write("Resolved product codes:", ", ".join(product_codes) if product_codes else "—")
+    if product_codes:
+        st.write("Resolved product codes:", ", ".join(product_codes))
+    else:
+        st.write("Resolved product codes: —")
 
     max_records = st.slider("Max records", 100, 5000, 2000, 100)
     go = st.button("Search", type="primary", disabled=not iso2 and not product_codes)
 
 if go:
     with st.spinner("Querying openFDA…"):
-        data = fetch_reglisting(iso2, product_codes, max_records=max_records)
+        data = fetch_reglisting(iso2, product_codes, state_code=state_code, max_records=max_records)
 
     if not data:
-        st.warning("No results. Try a different country or product selection.")
+        st.warning("No results. Try a different country/state or product selection.")
     else:
         # Normalize to table
         records = []
@@ -108,7 +140,9 @@ if go:
             reg = r.get("registration", {}) or {}
             products = r.get("products", []) or []
             product_codes_join = ", ".join(sorted({p.get("product_code","") for p in products if p.get("product_code")}))
-            est_types = ", ".join(sorted(set(r.get("establishment_type", [])))) if isinstance(r.get("establishment_type"), list) else r.get("establishment_type")
+            est_types = r.get("establishment_type")
+            if isinstance(est_types, list):
+                est_types = ", ".join(sorted(set(est_types)))
             records.append({
                 "FEI": reg.get("fei_number"),
                 "Firm Name": reg.get("name"),
@@ -119,6 +153,17 @@ if go:
                 "Product Codes": product_codes_join,
             })
         df = pd.DataFrame.from_records(records).drop_duplicates()
+
         st.success(f"Found {len(df):,} establishments")
         st.dataframe(df, use_container_width=True)
         st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"), "fda_mfrs.csv", "text/csv")
+
+        with st.expander("Debug details"):
+            st.write({
+                "country_iso2": iso2,
+                "state_code": state_code,
+                "product_codes": product_codes,
+                "api_key_present": bool(OPENFDA_API_KEY),
+            })
+else:
+    st.info("Set your filters in the sidebar and click **Search**.")
