@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import pycountry
+from typing import Optional, List
 from urllib.parse import quote_plus
 
 st.set_page_config(page_title="FDA Manufacturer Finder", layout="wide")
@@ -15,7 +16,7 @@ CLASS_ENDPOINT = f"{OPENFDA_BASE}/device/classification.json"
 OPENFDA_API_KEY = st.secrets.get("OPENFDA_API_KEY", None)
 DEFAULT_HEADERS = {"X-Api-Key": OPENFDA_API_KEY} if OPENFDA_API_KEY else {}
 
-def country_to_iso2(name_or_code: str) -> str | None:
+def country_to_iso2(name_or_code: str) -> Optional[str]:
     """Accepts 'United States' or 'US' and returns ISO-2 like 'US'."""
     if not name_or_code:
         return None
@@ -28,7 +29,7 @@ def country_to_iso2(name_or_code: str) -> str | None:
         return None
 
 @st.cache_data(show_spinner=False)
-def lookup_product_codes_by_name(q: str, limit=50):
+def lookup_product_codes_by_name(q: str, limit=50) -> List[str]:
     """Search device classification by device name, return unique product codes."""
     query = f"search=device_name:{quote_plus(q)}&limit={limit}"
     url = f"{CLASS_ENDPOINT}?{query}"
@@ -40,19 +41,27 @@ def lookup_product_codes_by_name(q: str, limit=50):
     codes = sorted({rec.get("product_code") for rec in results if rec.get("product_code")})
     return codes
 
-def build_reglisting_query(iso2: str, product_codes: list[str], state_code: str = "", limit=1000, skip=0):
+def build_reglisting_query(
+    iso2: str,
+    product_codes: List[str],
+    state_code: str = "",
+    limit: int = 1000,
+    skip: int = 0,
+) -> str:
     """
     Build openFDA Registrations & Listings query.
-    Examples:
       registration.iso_country_code:US
-      registration.state_code:CA  (only when iso2 == 'US')
+      registration.state_code.exact:"CA"  (only when iso2 == 'US')
       products.product_code:DQD
     """
     search_parts = []
     if iso2:
+        # country is OK without .exact, but you can also do exact if preferred:
+        # search_parts.append(f'registration.iso_country_code.exact:"{iso2}"')
         search_parts.append(f"registration.iso_country_code:{iso2}")
     if iso2 == "US" and state_code:
-        search_parts.append(f"registration.state_code:{state_code.upper()}")
+        # Important: use .exact for 2-letter state abbreviations
+        search_parts.append(f'registration.state_code.exact:"{state_code.upper()}"')
     for pc in product_codes:
         if pc:
             search_parts.append(f"products.product_code:{pc.upper()}")
@@ -61,7 +70,12 @@ def build_reglisting_query(iso2: str, product_codes: list[str], state_code: str 
     return f"{REG_LISTING_ENDPOINT}?search={search}&{params}" if search else f"{REG_LISTING_ENDPOINT}?{params}"
 
 @st.cache_data(show_spinner=True)
-def fetch_reglisting(iso2: str, product_codes: list[str], state_code: str = "", max_records=2000):
+def fetch_reglisting(
+    iso2: str,
+    product_codes: List[str],
+    state_code: str = "",
+    max_records: int = 2000
+):
     """Fetch paged results up to max_records."""
     rows = []
     limit = 1000
@@ -71,7 +85,6 @@ def fetch_reglisting(iso2: str, product_codes: list[str], state_code: str = "", 
         url = build_reglisting_query(iso2, product_codes, state_code=state_code, limit=limit, skip=skip)
         r = requests.get(url, timeout=60, headers=DEFAULT_HEADERS)
         if r.status_code != 200:
-            # Stop on error but return what we have
             break
         payload = r.json()
         results = payload.get("results", [])
@@ -108,10 +121,10 @@ with st.sidebar:
 
     mode = st.radio("Search by:", ["Product code(s)", "Device name"], horizontal=True)
 
-    product_codes = []
+    product_codes: List[str] = []
     device_name = ""
     if mode == "Product code(s)":
-        pcs = st.text_input("Product code(s), comma-separated", placeholder="e.g., DQD, MNO")
+        pcs = st.text_input("Product code(s), comma-separated", placeholder="e.g., DQD, FMF")
         product_codes = [p.strip().upper() for p in pcs.split(",") if p.strip()]
     else:
         device_name = st.text_input("Device name", placeholder="e.g., pulse oximeter")
@@ -119,13 +132,16 @@ with st.sidebar:
             with st.spinner("Finding product codes..."):
                 product_codes = lookup_product_codes_by_name(device_name)
 
-    if product_codes:
-        st.write("Resolved product codes:", ", ".join(product_codes))
-    else:
-        st.write("Resolved product codes: —")
+    resolved = ", ".join(product_codes) if product_codes else "—"
+    st.write("Resolved product codes:", resolved)
 
     max_records = st.slider("Max records", 100, 5000, 2000, 100)
     go = st.button("Search", type="primary", disabled=not iso2 and not product_codes)
+
+# --- Query preview (always visible for debugging) ---
+preview_url = build_reglisting_query(iso2, product_codes, state_code=state_code, limit=5, skip=0)
+st.caption("Query preview (first page):")
+st.code(preview_url, language="text")
 
 if go:
     with st.spinner("Querying openFDA…"):
@@ -134,7 +150,6 @@ if go:
     if not data:
         st.warning("No results. Try a different country/state or product selection.")
     else:
-        # Normalize to table
         records = []
         for r in data:
             reg = r.get("registration", {}) or {}
