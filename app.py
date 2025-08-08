@@ -46,19 +46,20 @@ def lookup_product_codes_by_name(q: str, limit=50):
 def build_reglisting_search(iso2: str, product_codes: list[str]) -> str:
     """
     Country AND (code1 OR code2 OR ...)
-    Example: registration.iso_country_code:US + (products.product_code:FMF OR products.product_code:DQD)
+    Use .exact for product codes so 3-letter codes match precisely.
     """
     parts = []
     if iso2:
         parts.append(f"registration.iso_country_code:{iso2}")
-    pcs = [pc.strip().upper() for pc in product_codes if pc and pc.strip()]
+
+    pcs = [pc.strip().upper() for pc in (product_codes or []) if pc and pc.strip()]
     if len(pcs) == 1:
-        parts.append(f"products.product_code:{pcs[0]}")
+        parts.append(f"products.product_code.exact:{pcs[0]}")
     elif len(pcs) > 1:
-        or_group = "+OR+".join([f"products.product_code:{pc}" for pc in pcs])
+        or_group = "+OR+".join([f"products.product_code.exact:{pc}" for pc in pcs])
         parts.append(f"({or_group})")
-    # Join with AND
-    return "+".join(parts)
+
+    return "+".join(parts) if parts else ""
 
 @st.cache_data(show_spinner=True)
 def fetch_reglisting(iso2: str, product_codes: list[str], max_records=2000):
@@ -66,7 +67,7 @@ def fetch_reglisting(iso2: str, product_codes: list[str], max_records=2000):
     search = build_reglisting_search(iso2, product_codes)
 
     while fetched < max_records:
-        params = {"search": search, "limit": limit, "skip": skip}
+        params = {"search": search, "limit": limit, "skip": skip} if search else {"limit": limit, "skip": skip}
         r = requests.get(REG_LISTING_ENDPOINT, params=params, timeout=60)
         if r.status_code != 200:
             break
@@ -117,22 +118,27 @@ def last_18_month_window() -> tuple[pd.Timestamp, pd.Timestamp, pd.PeriodIndex]:
 
 def build_maude_queries(firm_name: str, start_date: pd.Timestamp, end_date: pd.Timestamp) -> list[str]:
     date_clause = f'date_received:[{start_date:%Y%m%d}+TO+{end_date:%Y%m%d}]'
+    # Two avenues (either can match depending on record)
     a = f'manufacturer_name:"{firm_name}"+{date_clause}'
     b = f'device.manufacturer_d_name:"{firm_name}"+{date_clause}'
     return [a, b]
 
 @st.cache_data(show_spinner=True)
-def fetch_maude_events_18m(firm_name: str, max_records: int = 5000) -> pd.DataFrame:
+def fetch_maude_events_18m(firm_name: str, max_records: int = 5000) -> tuple[pd.DataFrame, list[str]]:
     start_date, end_date, _ = last_18_month_window()
     queries = build_maude_queries(firm_name, start_date, end_date)
 
     frames = []
     limit = 1000
+    preview_urls = []
     for q in queries:
         fetched = 0
         skip = 0
         while fetched < max_records:
             params = {"search": q, "limit": limit, "skip": skip}
+            prepared = requests.Request("GET", MAUDE_ENDPOINT, params=params).prepare().url
+            if skip == 0:  # only show first page per query in preview
+                preview_urls.append(prepared)
             r = requests.get(MAUDE_ENDPOINT, params=params, timeout=60)
             if r.status_code != 200:
                 break
@@ -148,19 +154,17 @@ def fetch_maude_events_18m(firm_name: str, max_records: int = 5000) -> pd.DataFr
             skip += n
 
     if not frames:
-        return pd.DataFrame(columns=["date_received"])
+        return pd.DataFrame(columns=["date_received"]), preview_urls
     df = pd.concat(frames, ignore_index=True)
     if "date_received" not in df.columns:
         df["date_received"] = pd.Series(dtype="object")
-    return df
+    return df, preview_urls
 
 def maude_monthly_counts_18m(df: pd.DataFrame) -> pd.DataFrame:
     start_date, end_date, months = last_18_month_window()
-    # Empty -> all zeros
     if df.empty:
         return pd.DataFrame({"month_ts": months.to_timestamp(), "count": [0]*len(months)})
 
-    # Parse and bound
     dt = pd.to_datetime(df["date_received"], format="%Y%m%d", errors="coerce")
     mask = (dt >= start_date) & (dt <= end_date)
     dt = dt[mask]
@@ -173,14 +177,15 @@ def maude_monthly_counts_18m(df: pd.DataFrame) -> pd.DataFrame:
     out["month_ts"] = out["month"].dt.to_timestamp()
     return out[["month_ts", "count"]]
 
-# ---------- UI: Filters in a FORM so selection doesn't reset ----------
+# ---------- UI: Filters in a FORM ----------
 st.title("FDA Manufacturer Finder")
-st.caption("Filter FDA device establishments by **country** and **products**, then pick a supplier to see **MAUDE** events for the last 18 months.")
+st.caption("Filter FDA device establishments by **country** and **product code(s)**, then pick a supplier to see **MAUDE** events for the last 18 months.")
 
 with st.sidebar:
     with st.form("filters_form", clear_on_submit=False):
         st.header("Filters")
-        country_input = st.text_input("Country (name or ISO-2)", value=st.session_state.search_params.get("country_input", "United States"))
+        country_input = st.text_input("Country (name or ISO-2)",
+                                      value=st.session_state.search_params.get("country_input", "United States"))
         iso2 = country_to_iso2(country_input) or ""
 
         mode = st.radio("Search by:", ["Product code(s)", "Device name"], horizontal=True,
@@ -190,20 +195,24 @@ with st.sidebar:
         device_name = ""
         if mode == "Product code(s)":
             pcs_default = st.session_state.search_params.get("pcs", "")
-            pcs = st.text_input("Product code(s), comma-separated", value=pcs_default, placeholder="e.g., DQD, FMF")
+            pcs = st.text_input("Product code(s), comma-separated",
+                                value=pcs_default, placeholder="e.g., DQD, FMF")
             product_codes = [p.strip().upper() for p in pcs.split(",") if p.strip()]
         else:
-            device_name = st.text_input("Device name", value=st.session_state.search_params.get("device_name",""), placeholder="e.g., pulse oximeter")
+            device_name = st.text_input("Device name",
+                                        value=st.session_state.search_params.get("device_name",""),
+                                        placeholder="e.g., pulse oximeter")
             if device_name:
                 with st.spinner("Finding product codes..."):
                     product_codes = lookup_product_codes_by_name(device_name)
 
         st.write("Resolved product codes:", ", ".join(product_codes) if product_codes else "—")
-        max_records = st.slider("Max registrations to pull", 100, 5000, st.session_state.search_params.get("max_records", 2000), 100)
+        max_records = st.slider("Max registrations to pull", 100, 5000,
+                                st.session_state.search_params.get("max_records", 2000), 100)
 
         submitted = st.form_submit_button("Search", type="primary")
 
-    # Save latest inputs to session (so they persist on rerun)
+    # Persist inputs
     st.session_state.search_params = {
         "country_input": country_input,
         "mode": mode,
@@ -212,7 +221,7 @@ with st.sidebar:
         "max_records": max_records,
     }
 
-# ---------- Run search only when submitted; otherwise reuse last results ----------
+# ---------- Run search only when submitted ----------
 if submitted:
     iso2 = country_to_iso2(st.session_state.search_params["country_input"]) or ""
     pcs_for_query = ([p.strip() for p in st.session_state.search_params.get("pcs","").split(",") if p.strip()]
@@ -221,19 +230,18 @@ if submitted:
     with st.spinner("Querying openFDA Registrations…"):
         rows = fetch_reglisting(iso2, pcs_for_query, max_records=st.session_state.search_params["max_records"])
     st.session_state.df_regs = normalize_reglisting_rows(rows) if rows else pd.DataFrame()
-    # Reset selection on new search
-    st.session_state.selected_label = None
+    st.session_state.selected_label = None  # reset selection after a new search
 
-# ---------- Show results if we have them ----------
+# ---------- Show results ----------
 df_regs = st.session_state.df_regs
 iso2_for_preview = country_to_iso2(st.session_state.search_params.get("country_input","")) or ""
 pcs_preview = ([p.strip() for p in st.session_state.search_params.get("pcs","").split(",") if p.strip()]
                if st.session_state.search_params.get("mode")=="Product code(s)" else
                lookup_product_codes_by_name(st.session_state.search_params.get("device_name","")))
-preview_params = {"search": build_reglisting_search(iso2_for_preview, pcs_preview), "limit": 5, "skip": 0}
-preview_url = requests.Request("GET", REG_LISTING_ENDPOINT, params=preview_params).prepare().url
+reg_preview_params = {"search": build_reglisting_search(iso2_for_preview, pcs_preview), "limit": 5, "skip": 0}
+reg_preview_url = requests.Request("GET", REG_LISTING_ENDPOINT, params=reg_preview_params).prepare().url
 st.caption("Registration query preview:")
-st.code(preview_url, language="text")
+st.code(reg_preview_url, language="text")
 
 if df_regs is None:
     st.info("Use the sidebar to search.")
@@ -244,27 +252,32 @@ else:
     st.dataframe(df_regs.drop(columns=["Firm Label"]), use_container_width=True)
     st.download_button("Download CSV", df_regs.to_csv(index=False).encode("utf-8"), "fda_mfrs.csv", "text/csv")
 
-    # ----- Selection persists via session_state so it won't reset the search
     st.subheader("MAUDE for selected supplier (last 18 months)")
     labels = df_regs["Firm Label"].tolist()
     default_index = labels.index(st.session_state.selected_label) if st.session_state.selected_label in labels else 0
     selected_label = st.selectbox("Choose a manufacturer", labels, index=default_index, key="selected_label")
 
-    # Drill-in once a label is selected
     if selected_label:
         sel_row = df_regs[df_regs["Firm Label"] == selected_label].iloc[0]
         firm_name = sel_row["Firm Name"]
         st.caption(f"MAUDE for **{firm_name}** — last 18 months")
 
-        with st.spinner("Fetching MAUDE events…"):
-            df_maude = fetch_maude_events_18m(firm_name)
+        try:
+            with st.spinner("Fetching MAUDE events…"):
+                df_maude, maude_preview_urls = fetch_maude_events_18m(firm_name)
+            # Preview the first page(s) of the MAUDE queries used
+            st.caption("MAUDE query preview(s):")
+            for url in maude_preview_urls:
+                st.code(url, language="text")
 
-        monthly = maude_monthly_counts_18m(df_maude)
-        st.line_chart(monthly.set_index("month_ts")["count"], height=300)
-        st.dataframe(df_maude, use_container_width=True)
-        st.download_button(
-            "Download MAUDE CSV (last 18 months)",
-            df_maude.to_csv(index=False).encode("utf-8"),
-            "maude_18m.csv",
-            "text/csv"
-        )
+            monthly = maude_monthly_counts_18m(df_maude)
+            st.line_chart(monthly.set_index("month_ts")["count"], height=300)
+            st.dataframe(df_maude, use_container_width=True)
+            st.download_button(
+                "Download MAUDE CSV (last 18 months)",
+                df_maude.to_csv(index=False).encode("utf-8"),
+                "maude_18m.csv",
+                "text/csv"
+            )
+        except Exception as e:
+            st.error(f"MAUDE lookup failed: {e}")
