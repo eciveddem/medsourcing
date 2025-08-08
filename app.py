@@ -41,33 +41,22 @@ def lookup_product_codes_by_name(q: str, limit=50) -> List[str]:
     codes = sorted({rec.get("product_code") for rec in results if rec.get("product_code")})
     return codes
 
-def build_reglisting_query(
-    iso2: str,
-    product_codes: List[str],
-    state_code: str = "",
-    limit: int = 1000,
-    skip: int = 0,
-) -> str:
+def build_reglisting_search(iso2: str, product_codes: List[str], state_code: str = "") -> str:
     """
-    Build openFDA Registrations & Listings query.
+    Build the openFDA search string (we'll pass this in requests.get(params=...)).
       registration.iso_country_code:US
-      registration.state_code.exact:"CA"  (only when iso2 == 'US')
+      registration.state_code.exact:CA  (only when iso2 == 'US'; note: NO quotes)
       products.product_code:DQD
     """
-    search_parts = []
+    parts = []
     if iso2:
-        # country is OK without .exact, but you can also do exact if preferred:
-        # search_parts.append(f'registration.iso_country_code.exact:"{iso2}"')
-        search_parts.append(f"registration.iso_country_code:{iso2}")
+        parts.append(f"registration.iso_country_code:{iso2}")
     if iso2 == "US" and state_code:
-        # Important: use .exact for 2-letter state abbreviations
-        search_parts.append(f'registration.state_code.exact:"{state_code.upper()}"')
+        parts.append(f"registration.state_code.exact:{state_code.upper()}")
     for pc in product_codes:
         if pc:
-            search_parts.append(f"products.product_code:{pc.upper()}")
-    search = "+".join(search_parts) if search_parts else ""
-    params = f"limit={limit}&skip={skip}"
-    return f"{REG_LISTING_ENDPOINT}?search={search}&{params}" if search else f"{REG_LISTING_ENDPOINT}?{params}"
+            parts.append(f"products.product_code:{pc.upper()}")
+    return "+".join(parts)
 
 @st.cache_data(show_spinner=True)
 def fetch_reglisting(
@@ -81,9 +70,11 @@ def fetch_reglisting(
     limit = 1000
     skip = 0
     fetched = 0
+    search = build_reglisting_search(iso2, product_codes, state_code)
+
     while fetched < max_records:
-        url = build_reglisting_query(iso2, product_codes, state_code=state_code, limit=limit, skip=skip)
-        r = requests.get(url, timeout=60, headers=DEFAULT_HEADERS)
+        params = {"search": search, "limit": limit, "skip": skip}
+        r = requests.get(REG_LISTING_ENDPOINT, params=params, timeout=60, headers=DEFAULT_HEADERS)
         if r.status_code != 200:
             break
         payload = r.json()
@@ -122,7 +113,6 @@ with st.sidebar:
     mode = st.radio("Search by:", ["Product code(s)", "Device name"], horizontal=True)
 
     product_codes: List[str] = []
-    device_name = ""
     if mode == "Product code(s)":
         pcs = st.text_input("Product code(s), comma-separated", placeholder="e.g., DQD, FMF")
         product_codes = [p.strip().upper() for p in pcs.split(",") if p.strip()]
@@ -139,9 +129,11 @@ with st.sidebar:
     go = st.button("Search", type="primary", disabled=not iso2 and not product_codes)
 
 # --- Query preview (always visible for debugging) ---
-preview_url = build_reglisting_query(iso2, product_codes, state_code=state_code, limit=5, skip=0)
-st.caption("Query preview (first page):")
-st.code(preview_url, language="text")
+_preview_search = build_reglisting_search(iso2, product_codes, state_code)
+_preview_params = {"search": _preview_search, "limit": 5, "skip": 0}
+_preview = requests.Request("GET", REG_LISTING_ENDPOINT, params=_preview_params).prepare().url
+st.caption("Query preview (first page, auto-encoded):")
+st.code(_preview, language="text")
 
 if go:
     with st.spinner("Querying openFDA…"):
